@@ -1025,7 +1025,21 @@ async def _standalone_send(
     }
     upload_headers = {"Authorization": f"Bearer {token}"}
 
-    media_files = media_files or []
+    # Normalize the canonical ``(file_path, is_voice)`` tuple form produced by
+    # ``BasePlatformAdapter.extract_media`` to the raw-string form this function
+    # uses internally. ``tools/send_message_tool._send_to_platform`` passes the
+    # tuple form through to ``standalone_sender_fn``; without this normalization
+    # ``os.stat`` / ``open`` would receive a tuple instead of a path and raise
+    # ``TypeError: stat: path should be string, bytes, os.PathLike or integer,
+    # not tuple``. Accept dicts and raw strings unchanged so existing direct
+    # callers (tests, scripts) keep working.
+    normalized_media: List = []
+    for _m in (media_files or []):
+        if isinstance(_m, tuple):
+            normalized_media.append(_m[0])
+        else:
+            normalized_media.append(_m)
+    media_files = normalized_media
 
     try:
         # Resolve proxy + session kwargs once so a single ClientSession can

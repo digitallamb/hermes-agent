@@ -1157,6 +1157,209 @@ class TestMatrixMediaLiveAdapterReuse:
         assert ("disconnect",) in calls
 
 
+class TestMattermostStandaloneMediaTupleNormalization:
+    """Regression tests for the ``_standalone_send`` shape contract.
+
+    ``_standalone_send`` (``plugins/platforms/mattermost/adapter.py``) was
+    documented as accepting raw paths or ``{"path": ...}`` dicts. The
+    dispatcher in ``tools/send_message_tool._send_to_platform`` passes the
+    canonical ``(file_path, is_voice)`` tuple form produced by
+    ``BasePlatformAdapter.extract_media`` through unchanged — so any caller
+    that wires Mattermost MEDIA delivery into the standalone (cron /
+    out-of-process) path crashed with::
+
+        TypeError: stat: path should be string, bytes, os.PathLike or integer,
+        not tuple
+
+    These tests cover the normalization at the ``_standalone_send`` boundary
+    so the bug never reappears even if more callers start passing the
+    canonical tuple form.
+    """
+
+    @pytest.fixture
+    def _tmp_media(self, tmp_path):
+        # 4-byte file — never read, just exists for os.stat/os.path.exists
+        p = tmp_path / "media.bin"
+        p.write_bytes(b"x" * 4)
+        return str(p)
+
+    @pytest.fixture
+    def _captured_calls(self):
+        """Thread-safe list for HTTP calls captured by the mock session."""
+        return []
+
+    @pytest.fixture
+    def _mock_aiohttp(self, monkeypatch, _captured_calls):
+        """Stub aiohttp.ClientSession so we can assert what gets uploaded
+        without doing real network I/O. Calls are recorded into the shared
+        _captured_calls list."""
+
+        class _Resp:
+            def __init__(self, status, payload):
+                self.status = status
+                self._payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def text(self):
+                return json.dumps(self._payload)
+
+            async def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                if self.status >= 400:
+                    raise RuntimeError(f"http {self.status}")
+
+        class _Session:
+            def __init__(self, *a, **kw):
+                self._i = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def post(self, url, data=None, headers=None, **_kw):
+                _captured_calls.append({"url": url, "data": data, "headers": headers})
+                self._i += 1
+                if "/api/v4/files" in url:
+                    return _Resp(200, {"file_infos": [{"id": f"fid{self._i}"}]})
+                # /posts (final post-create call)
+                return _Resp(200, {"id": f"postid{self._i}"})
+
+        class _Timeout:
+            def __init__(self, total=None):
+                self.total = total
+
+        fake = ModuleType("aiohttp")
+        fake.ClientSession = _Session
+        fake.ClientTimeout = _Timeout
+        fake.FormData = MagicMock
+        fake.ClientError = RuntimeError  # raised on network errors; the
+                                          # standalone_send handler catches
+                                          # it via ``except aiohttp.ClientError``.
+        monkeypatch.setitem(sys.modules, "aiohttp", fake)
+        return fake
+
+    @pytest.fixture
+    def _pconfig(self, monkeypatch):
+        monkeypatch.setenv("MATTERMOST_URL", "https://mm.test")
+        monkeypatch.setenv("MATTERMOST_TOKEN", "fake-token")
+        from types import SimpleNamespace as _SN
+        return _SN(token="fake-token", extra={"url": "https://mm.test"})
+
+    def test_standalone_send_accepts_tuple_media_files(
+        self, _tmp_media, _mock_aiohttp, _pconfig, _captured_calls
+    ):
+        """The canonical ``(path, is_voice)`` tuple form from
+        ``BasePlatformAdapter.extract_media`` must reach the upload step
+        without raising ``TypeError``, and the resulting upload must use
+        the raw path (not a tuple-stringified form)."""
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        result = asyncio.run(
+            _standalone_send(
+                _pconfig,
+                "channel-abc",
+                "msg body",
+                media_files=[(_tmp_media, False)],
+            )
+        )
+        assert "error" not in result, f"unexpected error: {result!r}"
+
+        uploads = [c for c in _captured_calls if "/api/v4/files" in c["url"]]
+        assert len(uploads) == 1, f"expected 1 upload, got: {uploads!r}"
+        # FormData mock captures positional args; the upload was attempted
+        # at all (no TypeError on os.stat/open). Filename sanity check on
+        # whatever FormData recorded: must be a string, not a tuple repr.
+        form = uploads[0]["data"]
+        # MagicMock() recorded: add_field("files", content, filename=...)
+        # find the add_field calls — they're on the mock's method_calls.
+        add_field_calls = [
+            call_args for call_args in form.method_calls
+            if len(call_args) > 0 and call_args[0] == "add_field"
+        ]
+        assert add_field_calls, f"FormData.add_field never called: {form.method_calls!r}"
+        # MagicMock.method_calls returns _Call objects whose [0] is the method
+        # name and [1] is the positional-args tuple. We want add_field('files', ...).
+        files_call = next(
+            (
+                c for c in add_field_calls
+                if len(c.args) > 0 and c.args[0] == "files"
+            ),
+            None,
+        )
+        assert files_call is not None, f"add_field('files', ...) not found: {add_field_calls!r}"
+        # The keyword "filename" must be a string (basename), not a tuple repr
+        # like "('/tmp/x.png', False)" — that would mean the tuple leaked through
+        # un-normalized and os.path.basename got a tuple.
+        filename = files_call.kwargs.get("filename")
+        assert isinstance(filename, str) and "/" not in filename, (
+            f"filename should be a basename string, got {filename!r} — "
+            "tuple form was passed through un-normalized"
+        )
+
+    def test_standalone_send_accepts_raw_string_media_files(
+        self, _tmp_media, _mock_aiohttp, _pconfig
+    ):
+        """Direct callers that pass raw path strings keep working."""
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        result = asyncio.run(
+            _standalone_send(
+                _pconfig,
+                "channel-abc",
+                "msg body",
+                media_files=[_tmp_media],
+            )
+        )
+        assert "error" not in result, f"unexpected error: {result!r}"
+
+    def test_standalone_send_accepts_dict_media_files(
+        self, _tmp_media, _mock_aiohttp, _pconfig
+    ):
+        """Direct callers that pass ``{"path": ...}`` dicts keep working."""
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        result = asyncio.run(
+            _standalone_send(
+                _pconfig,
+                "channel-abc",
+                "msg body",
+                media_files=[{"path": _tmp_media}],
+            )
+        )
+        assert "error" not in result, f"unexpected error: {result!r}"
+
+    def test_standalone_send_mixed_shapes_all_normalized(
+        self, _tmp_media, _mock_aiohttp, _pconfig
+    ):
+        """Mixed-shape input list (tuple + dict + raw string) is normalized
+        uniformly. Catches a regression where the normalization only handles
+        one shape and silently drops the rest."""
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        result = asyncio.run(
+            _standalone_send(
+                _pconfig,
+                "channel-abc",
+                "msg body",
+                media_files=[
+                    (_tmp_media, False),  # canonical tuple
+                    {"path": _tmp_media},  # dict
+                    _tmp_media,            # raw string
+                ],
+            )
+        )
+        assert "error" not in result, f"unexpected error: {result!r}"
+
+
 # ---------------------------------------------------------------------------
 # HTML auto-detection in Telegram send
 # ---------------------------------------------------------------------------
