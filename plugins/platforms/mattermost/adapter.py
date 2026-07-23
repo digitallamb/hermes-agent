@@ -267,6 +267,57 @@ class MattermostAdapter(BasePlatformAdapter):
             infos = data.get("file_infos", [])
             return infos[0]["id"] if infos else None
 
+    @staticmethod
+    async def _maybe_compress_image(
+        file_data: bytes, filename: str, content_type: str
+    ) -> bytes:
+        """Compress PNG/JPEG image data if it's over 800 KB to fit nginx body limits.
+
+        Most public Mattermost deployments sit behind an nginx reverse proxy
+        with the default ``client_max_body_size: 1m`` (1 MB). Without this,
+        uploads between ~800 KB and the server's configured limit fail with
+        ``413 Request Entity Too Large`` regardless of whether the user has
+        permission to upload. Re-encoding oversized PNGs as JPEG (or
+        recompressing RGBA PNGs) reliably brings images under 800 KB.
+
+        Falls back gracefully: any PIL error logs a warning and returns the
+        original bytes — never blocks delivery on a compression failure.
+
+        Static method (not ``self``-bound) so the module-level
+        ``_standalone_send`` cron path can call it without needing a live
+        adapter instance.
+        """
+        if len(file_data) <= 800 * 1024:
+            return file_data
+        if content_type not in ("image/png", "image/jpeg", "image/jpg"):
+            return file_data
+
+        try:
+            from io import BytesIO
+            from PIL import Image
+
+            img = Image.open(BytesIO(file_data))
+            quality = 85
+            while True:
+                buf = BytesIO()
+                if img.mode == "RGBA":
+                    img.save(buf, format="PNG", compress_level=6)
+                else:
+                    img.save(buf, format="JPEG", quality=quality)
+                compressed = buf.getvalue()
+                if len(compressed) <= 800 * 1024 or quality <= 50:
+                    break
+                quality -= 10
+
+            logger.info(
+                "Mattermost: compressed %s (%d→%d bytes, quality=%d)",
+                filename, len(file_data), len(compressed), quality,
+            )
+            return compressed
+        except Exception as exc:
+            logger.warning("Mattermost: image compression failed: %s", exc)
+            return file_data
+
     # ------------------------------------------------------------------
     # Required overrides
     # ------------------------------------------------------------------
@@ -539,6 +590,7 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.warning("Mattermost: download returned no data for %s", url)
             return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
 
+        file_data = await self._maybe_compress_image(file_data, fname, ct)
         file_id = await self._upload_file(chat_id, file_data, fname, ct)
         if not file_id:
             return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
@@ -580,6 +632,7 @@ class MattermostAdapter(BasePlatformAdapter):
         ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         file_data = p.read_bytes()
 
+        file_data = await self._maybe_compress_image(file_data, fname, ct)
         file_id = await self._upload_file(chat_id, file_data, fname, ct)
         if not file_id:
             return SendResult(success=False, error="File upload failed")
@@ -665,6 +718,7 @@ class MattermostAdapter(BasePlatformAdapter):
                             continue
                         fname = image_url.rsplit("/", 1)[-1].split("?")[0] or f"image_{len(file_ids)}.png"
 
+                    file_data = await self._maybe_compress_image(file_data, fname, ct)
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
@@ -1048,12 +1102,19 @@ async def _standalone_send(
                 # Mattermost requires channel_id on file uploads so the
                 # server can attribute them.
                 form.add_field("channel_id", chat_id)
+                # Read once so we can both feed compression and upload.
                 with open(file_path, "rb") as fh:
-                    form.add_field(
-                        "files",
-                        fh.read(),
-                        filename=os.path.basename(file_path),
-                    )
+                    raw_data = fh.read()
+                import mimetypes
+                ct = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+                compressed = await MattermostAdapter._maybe_compress_image(
+                    raw_data, os.path.basename(file_path), ct,
+                )
+                form.add_field(
+                    "files",
+                    compressed,
+                    filename=os.path.basename(file_path),
+                )
                 async with session.post(
                     f"{base_url}/api/v4/files",
                     data=form,
